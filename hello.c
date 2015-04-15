@@ -7,7 +7,9 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/proc_fs.h>
 #include <linux/sched.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
@@ -32,6 +34,7 @@ struct scull_dev {
   uint64_t size;
   struct scull_qset* data;
   struct cdev cdev;
+  struct proc_dir_entry* proc_entry;
 };
 
 struct scull_dev scull_dev;
@@ -51,6 +54,16 @@ static struct file_operations scull_ops = {
   .llseek = scull_llseek,
 };
 
+static int scull_proc_open(struct inode* inode, struct file* filp);
+
+static struct file_operations scull_proc_ops = {
+  .owner = THIS_MODULE,
+  .open = scull_proc_open,
+  .read = seq_read,
+  .llseek = seq_lseek,
+  .release = seq_release,
+};
+
 static int scull_setup_cdev(struct scull_dev* dev, dev_t devno) {
   int err;
   cdev_init(&dev->cdev, &scull_ops);
@@ -67,6 +80,15 @@ static int scull_setup_cdev(struct scull_dev* dev, dev_t devno) {
 
 static void scull_teardown_cdev(struct scull_dev* dev) {
   cdev_del(&dev->cdev);
+}
+
+static int scull_setup_proc_file(struct scull_dev* dev) {
+  dev->proc_entry = proc_create("scull_device", S_IRUGO, NULL, &scull_proc_ops);
+  return dev->proc_entry != NULL ? 0 : 1;
+}
+
+static void scull_teardown_proc_file(struct scull_dev* dev) {
+  proc_remove(dev->proc_entry);
 }
 
 static int hello_init(void) {
@@ -90,7 +112,13 @@ static int hello_init(void) {
     goto error_scull_setup_cdev;
   }
 
+  if (scull_setup_proc_file(&scull_dev) != 0) {
+    goto error_scull_setup_proc_file;
+  }
+
   return 0;
+error_scull_setup_proc_file:
+  scull_teardown_cdev(&scull_dev);
 error_scull_setup_cdev:
   unregister_chrdev_region(MKDEV(scull_major, 0), scull_nr_devs);
 error_register_dev_t:
@@ -123,6 +151,7 @@ static void hello_exit(void) {
   pr_alert("Goodbye, cruel world\n");
   pr_alert("In process \"%s\" (pid %d, tgid %d)\n", current->comm, current->pid, current->tgid);
 
+  scull_teardown_proc_file(&scull_dev);
   scull_teardown_cdev(&scull_dev);
   unregister_chrdev_region(MKDEV(scull_major, 0), scull_nr_devs);
 }
@@ -322,6 +351,63 @@ static ssize_t scull_write(struct file* filp, const char __user* buf, size_t cou
 
 out:
   return retval;
+}
+
+static int scull_proc_open(struct inode* inode, struct file* filp);
+static void* scull_seq_start(struct seq_file* m, loff_t* pos);
+static void scull_seq_stop(struct seq_file* m, void* v);
+static void* scull_seq_next(struct seq_file* m, void* v, loff_t* pos);
+static int scull_seq_show(struct seq_file* m, void* v);
+
+static struct seq_operations seq_ops = {
+  .start = scull_seq_start,
+  .stop = scull_seq_stop,
+  .next = scull_seq_next,
+  .show = scull_seq_show,
+};
+
+static int scull_proc_open(struct inode* inode, struct file* filp) {
+  return seq_open(filp, &seq_ops);
+}
+
+static void* scull_seq_start(struct seq_file* m, loff_t* pos) {
+  if (*pos > 0) {
+    return NULL;
+  }
+  return &scull_dev;
+}
+
+static void scull_seq_stop(struct seq_file* m, void* v) {
+
+}
+
+static void* scull_seq_next(struct seq_file* m, void* v, loff_t* pos) {
+  ++*pos;
+  return NULL;
+}
+
+static int scull_seq_show(struct seq_file* m, void* v) {
+  struct scull_dev* dev = v;
+  struct scull_qset* dptr;
+  unsigned i;
+
+  if (m->index != 0) {
+    return 0;
+  }
+
+  seq_printf(m, "Device (%d,%d): qset %u, quantum %u, size %llu\n",
+             MAJOR(dev->cdev.dev), MINOR(dev->cdev.dev), dev->qset,
+             dev->quantum, dev->size);
+  for (dptr = dev->data; dptr != NULL; dptr = dptr->next) {
+    seq_printf(m, "  item at %p, qset at %p\n", dptr, dptr->data);
+    // Dump only the least item.
+    if (dptr->data && dptr->next == NULL) {
+      for (i = 0; i < dev->qset; ++i) {
+        seq_printf(m, "    %4u: %8p\n", i, dptr->data[i]);
+      }
+    }
+  }
+  return 0;
 }
 
 module_init(hello_init);
