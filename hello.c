@@ -9,6 +9,7 @@
 #include <linux/moduleparam.h>
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
+#include <linux/semaphore.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -29,6 +30,7 @@ unsigned scull_nr_devs = 1;
 
 
 struct scull_dev {
+  struct semaphore sem;
   unsigned qset;
   unsigned quantum;
   uint64_t size;
@@ -108,6 +110,11 @@ static int hello_init(void) {
   }
   pr_alert("register/alloc chrdev_region major %d, minor 0-%d\n", scull_major, scull_nr_devs - 1);
 
+  sema_init(&scull_dev.sem, 1);
+  scull_dev.quantum = scull_quantum;
+  scull_dev.qset = scull_qset;
+  scull_dev.size = 0;
+  scull_dev.data = NULL;
   if (scull_setup_cdev(&scull_dev, MKDEV(scull_major, 0)) != 0) {
     goto error_scull_setup_cdev;
   }
@@ -125,9 +132,12 @@ error_register_dev_t:
   return 1;
 }
 
-int scull_trim(struct scull_dev* dev) {
+static int scull_trim(struct scull_dev* dev) {
   unsigned qset;
   struct scull_qset* dptr, *next;
+  if (down_interruptible(&dev->sem)) {
+    return -ERESTARTSYS;
+  }
   qset = dev->qset;
   for (dptr = dev->data; dptr != NULL; dptr = next) {
     unsigned i;
@@ -144,6 +154,8 @@ int scull_trim(struct scull_dev* dev) {
   dev->quantum = scull_quantum;
   dev->qset = scull_qset;
   dev->data = NULL;
+
+  up(&dev->sem);
   return 0;
 }
 
@@ -162,7 +174,7 @@ static int scull_open(struct inode* inode, struct file* filp) {
   dev = container_of(inode->i_cdev, struct scull_dev, cdev);
   filp->private_data = dev;
   if ((filp->f_flags & O_ACCMODE) == O_WRONLY) {
-    scull_trim(dev);
+    return scull_trim(dev);
   }
   return 0;
 }
@@ -175,13 +187,20 @@ static int scull_release(struct inode* inode, struct file* filp) {
 static ssize_t scull_read(struct file* filp, char __user* buf, size_t count, loff_t* f_pos) {
   struct scull_dev* dev = filp->private_data;
   struct scull_qset* dptr;
-  unsigned quantum = dev->quantum;
-  unsigned qset = dev->qset;
-  uint64_t itemsize = (uint64_t)quantum * qset;
+  unsigned quantum;
+  unsigned qset;
+  uint64_t itemsize;
   uint64_t last_pos = *f_pos;
   size_t last_count;
   int retval = 0;
   pr_alert("scull_read, size = %llu\n", dev->size);
+
+  if (down_interruptible(&dev->sem)) {
+    return -ERESTARTSYS;
+  }
+  quantum = dev->quantum;
+  qset = dev->qset;
+  itemsize = (uint64_t)quantum * qset;
 
   for (dptr = dev->data; dptr != NULL; dptr = dptr->next) {
     if (last_pos < itemsize) {
@@ -234,14 +253,20 @@ static ssize_t scull_read(struct file* filp, char __user* buf, size_t count, lof
            count, retval, *f_pos);
 
 out:
+  up(&dev->sem);
   return retval;
 }
 
 static loff_t scull_llseek(struct file* filp, loff_t offset, int whence) {
   struct scull_dev* dev = filp->private_data;
-  uint64_t size = dev->size;
+  uint64_t size;
   loff_t new_pos;
   loff_t retval = 0;
+
+  if (down_interruptible(&dev->sem)) {
+    return -ERESTARTSYS;
+  }
+  size = dev->size;
 
   if (whence == 0) {
     new_pos = offset;
@@ -261,17 +286,26 @@ static loff_t scull_llseek(struct file* filp, loff_t offset, int whence) {
   filp->f_pos = new_pos;
   retval = new_pos;
 out:
+  up(&dev->sem);
   return retval;
 }
 static ssize_t scull_write(struct file* filp, const char __user* buf, size_t count, loff_t* f_pos) {
   struct scull_dev* dev = filp->private_data;
   struct scull_qset* dptr, *prev_qset;
-  unsigned quantum = dev->quantum;
-  unsigned qset = dev->qset;
-  uint64_t itemsize = (uint64_t)quantum * qset;
+  unsigned quantum;
+  unsigned qset;
+  uint64_t itemsize;
   uint64_t last_pos = *f_pos;
   size_t last_count;
   int retval = 0;
+
+  if (down_interruptible(&dev->sem)) {
+    return -ERESTARTSYS;
+  }
+  quantum = dev->quantum;
+  qset = dev->qset;
+  itemsize = (uint64_t)quantum * qset;
+
   pr_alert("scull_write\n");
 
   prev_qset = NULL;
@@ -350,6 +384,7 @@ static ssize_t scull_write(struct file* filp, const char __user* buf, size_t cou
            count, retval, *f_pos, dev->size);
 
 out:
+  up(&dev->sem);
   return retval;
 }
 
@@ -391,8 +426,8 @@ static int scull_seq_show(struct seq_file* m, void* v) {
   struct scull_qset* dptr;
   unsigned i;
 
-  if (m->index != 0) {
-    return 0;
+  if (down_interruptible(&dev->sem)) {
+    return -ERESTARTSYS;
   }
 
   seq_printf(m, "Device (%d,%d): qset %u, quantum %u, size %llu\n",
@@ -407,6 +442,7 @@ static int scull_seq_show(struct seq_file* m, void* v) {
       }
     }
   }
+  up(&dev->sem);
   return 0;
 }
 
