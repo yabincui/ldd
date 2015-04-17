@@ -185,7 +185,7 @@ static int scull_trim(struct scull_dev* dev) {
 static void hello_exit(void) {
   pr_alert("Goodbye, cruel world\n");
   pr_alert("In process \"%s\" (pid %d, tgid %d)\n", current->comm, current->pid, current->tgid);
-
+  scull_trim(&scull_dev);
   scull_teardown_proc_file(&scull_dev);
   scull_teardown_cdev(&scull_dev);
   unregister_chrdev_region(MKDEV(scull_major, 0), scull_nr_devs);
