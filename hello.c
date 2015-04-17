@@ -1,8 +1,8 @@
-#include <asm/uaccess.h>
 #include <linux/cdev.h>
 #include <linux/fcntl.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/ioctl.h>
 #include <linux/kdev_t.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -13,14 +13,35 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <linux/uaccess.h>
 
 #include "scull.h"
 
 MODULE_LICENSE("Dual BSD/GPL");
 
+#define SCULL_IOC_MAGIC 'z'
+enum {
+  SCULL_IOC_NR_FIRST = 0x80,
+  SCULL_IOC_NR_RESET_QUANTUM_QSET = SCULL_IOC_NR_FIRST,
+  SCULL_IOC_NR_GET_QUANTUM,
+  SCULL_IOC_NR_SET_QUANTUM,
+  SCULL_IOC_NR_GET_QSET,
+  SCULL_IOC_NR_SET_QSET,
+  SCULL_IOC_NR_LAST,
+};
+
+#define SCULL_IOC_RESET_QUANTUM_QSET  _IO(SCULL_IOC_MAGIC, SCULL_IOC_NR_RESET_QUANTUM_QSET)
+#define SCULL_IOC_GET_QUANTUM _IO(SCULL_IOC_MAGIC, SCULL_IOC_NR_GET_QUANTUM)
+#define SCULL_IOC_SET_QUANTUM _IO(SCULL_IOC_MAGIC, SCULL_IOC_NR_SET_QUANTUM)
+#define SCULL_IOC_GET_QSET    _IO(SCULL_IOC_MAGIC, SCULL_IOC_NR_GET_QSET)
+#define SCULL_IOC_SET_QSET    _IO(SCULL_IOC_MAGIC, SCULL_IOC_NR_SET_QSET)
+
+#define SCULL_QUANTUM   1024
+#define SCULL_QSET      1024
+
 unsigned scull_major = 88;
-unsigned scull_qset = 1024;
-unsigned scull_quantum = 1024;
+unsigned scull_qset = SCULL_QSET;
+unsigned scull_quantum = SCULL_QUANTUM;
 
 module_param(scull_major, uint, S_IRUGO);
 module_param(scull_qset, uint, S_IRUGO);
@@ -46,6 +67,7 @@ static int scull_release(struct inode* inode, struct file* filp);
 static ssize_t scull_read(struct file* filp, char __user* buf, size_t count, loff_t* f_pos);
 static ssize_t scull_write(struct file* filp, const char __user* buf, size_t count, loff_t* f_pos);
 static loff_t scull_llseek(struct file* filp, loff_t offset, int whence);
+static long scull_ioctl(struct file* filp, unsigned int cmd, unsigned long arg);
 
 static struct file_operations scull_ops = {
   .owner = THIS_MODULE,
@@ -54,6 +76,7 @@ static struct file_operations scull_ops = {
   .read = scull_read,
   .write = scull_write,
   .llseek = scull_llseek,
+  .unlocked_ioctl = scull_ioctl,
 };
 
 static int scull_proc_open(struct inode* inode, struct file* filp);
@@ -385,6 +408,38 @@ static ssize_t scull_write(struct file* filp, const char __user* buf, size_t cou
 
 out:
   up(&dev->sem);
+  return retval;
+}
+
+static long scull_ioctl(struct file* filp, unsigned int cmd, unsigned long arg) {
+  long retval = 0;
+
+  if (_IOC_TYPE(cmd) != SCULL_IOC_MAGIC ||
+      !(_IOC_NR(cmd) >= SCULL_IOC_NR_FIRST && _IOC_NR(cmd) < SCULL_IOC_NR_LAST)) {
+    return -ENOTTY;
+  }
+  switch (cmd) {
+    case SCULL_IOC_RESET_QUANTUM_QSET:
+      scull_quantum = SCULL_QUANTUM;
+      scull_qset = SCULL_QSET;
+      break;
+    case SCULL_IOC_GET_QUANTUM:
+      retval = scull_quantum;
+      break;
+    case SCULL_IOC_SET_QUANTUM:
+      retval = scull_quantum;
+      scull_quantum = arg;
+      break;
+    case SCULL_IOC_GET_QSET:
+      retval = scull_qset;
+      break;
+    case SCULL_IOC_SET_QSET:
+      retval = scull_qset;
+      scull_qset = arg;
+      break;
+    default:
+      retval = -ENOTTY;
+  }
   return retval;
 }
 
