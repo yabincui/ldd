@@ -5,6 +5,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/poll.h>
 #include <linux/sched.h>
 #include <linux/semaphore.h>
 #include <linux/slab.h>
@@ -37,6 +38,7 @@ struct scull_pipe_dev {
   char* read_head;
   char* write_head;
   wait_queue_head_t reader_wq, writer_wq;
+  unsigned nr_reader, nr_writer;
   struct cdev cdev;
 };
 
@@ -52,6 +54,9 @@ static int scull_pipe_open(struct inode* inode, struct file* filp);
 static int scull_pipe_release(struct inode* inode, struct file* filp);
 static ssize_t scull_pipe_read(struct file* filp, char __user* buf, size_t count, loff_t* f_pos);
 static ssize_t scull_pipe_write(struct file* filp, const char __user* buf, size_t count, loff_t* f_pos);
+static unsigned int scull_pipe_poll(struct file* filp, struct poll_table_struct* poll_table);
+
+static int is_buffer_empty_and_has_no_writer(struct scull_pipe_dev* dev);
 
 static struct file_operations scull_pipe_ops = {
   .owner = THIS_MODULE,
@@ -59,8 +64,8 @@ static struct file_operations scull_pipe_ops = {
   .release = scull_pipe_release,
   .read = scull_pipe_read,
   .write = scull_pipe_write,
+  .poll = scull_pipe_poll,
 };
-
 
 static int scull_pipe_init(void) {
   pr_alert("scull_pipe_init\n");
@@ -108,6 +113,8 @@ static int scull_pipe_setup_dev(struct scull_pipe_dev* dev, dev_t devno) {
   }
   dev->read_head = dev->buffer;
   dev->write_head = dev->buffer;
+  dev->nr_reader = 0;
+  dev->nr_writer = 0;
   init_waitqueue_head(&dev->reader_wq);
   init_waitqueue_head(&dev->writer_wq);
 
@@ -145,19 +152,73 @@ static void scull_pipe_teardown_cdev(struct scull_pipe_dev* dev) {
 
 static int scull_pipe_open(struct inode* inode, struct file* filp) {
   struct scull_pipe_dev* dev;
+  int retval = 0;
   pr_alert("scull_pipe_open\n");
   dev = container_of(inode->i_cdev, struct scull_pipe_dev, cdev);
   filp->private_data = dev;
-  return 0;
+  if (down_interruptible(&dev->sem)) {
+    retval = -ERESTARTSYS;
+    goto out;
+  }
+
+  if ((filp->f_flags & O_ACCMODE) == O_RDONLY) {
+    dev->nr_reader++;
+    // Wait for writer if there is no data and no writer.
+    if (is_buffer_empty_and_has_no_writer(dev) && (filp->f_flags & O_NONBLOCK) == 0) {
+      up(&dev->sem);
+      if (wait_event_interruptible(dev->reader_wq, !is_buffer_empty_and_has_no_writer(dev))) {
+        retval = -ERESTARTSYS;
+        goto out;
+      }
+      if (down_interruptible(&dev->sem)) {
+        retval = -ERESTARTSYS;
+        goto out;
+      }
+    }
+  } else if ((filp->f_flags & O_ACCMODE) == O_WRONLY) {
+    dev->nr_writer++;
+  } else {
+    retval = -EINVAL;
+    goto out_with_lock;
+  }
+
+out_with_lock:
+  up(&dev->sem);
+out:
+  return retval;
 }
 
 static int scull_pipe_release(struct inode* inode, struct file* filp) {
+  struct scull_pipe_dev* dev = filp->private_data;
+  int retval = 0;
   pr_alert("scull_pipe_release\n");
-  return 0;
+
+  if (down_interruptible(&dev->sem)) {
+    retval = -ERESTARTSYS;
+    goto out;
+  }
+
+  if ((filp->f_flags & O_ACCMODE) == O_RDONLY) {
+    dev->nr_reader--;
+  } else if ((filp->f_flags & O_ACCMODE) == O_WRONLY) {
+    dev->nr_writer--;
+  }
+
+  up(&dev->sem);
+out:
+  return retval;
 }
 
 static int is_buffer_empty(struct scull_pipe_dev* dev) {
   return dev->read_head == dev->write_head;
+}
+
+static int is_buffer_empty_and_has_writer(struct scull_pipe_dev* dev) {
+  return dev->nr_writer != 0 && is_buffer_empty(dev);
+}
+
+static int is_buffer_empty_and_has_no_writer(struct scull_pipe_dev* dev) {
+  return dev->nr_writer == 0 && is_buffer_empty(dev);
 }
 
 static ssize_t scull_pipe_read(struct file* filp, char __user* buf, size_t count, loff_t* f_pos) {
@@ -173,13 +234,13 @@ static ssize_t scull_pipe_read(struct file* filp, char __user* buf, size_t count
     goto out;
   }
 
-  while (is_buffer_empty(dev)) {
+  while (is_buffer_empty_and_has_writer(dev)) {
     up(&dev->sem);
     if (filp->f_flags & O_NONBLOCK) {
       retval =  -EAGAIN;
       goto out;
     }
-    retval = wait_event_interruptible(dev->reader_wq, !is_buffer_empty(dev));
+    retval = wait_event_interruptible(dev->reader_wq, !is_buffer_empty_and_has_writer(dev));
     if (retval != 0) {
       retval = -ERESTARTSYS;
       goto out;
@@ -308,6 +369,29 @@ out_with_lock:
 out:
   pr_alert("scull_pipe_write retval = %zd\n", retval);
   return retval;
+}
+
+static unsigned int scull_pipe_poll(struct file* filp, struct poll_table_struct* poll_table) {
+  struct scull_pipe_dev* dev = filp->private_data;
+  unsigned int mask = 0;
+
+  pr_alert("scull_pipe_poll\n");
+
+  down(&dev->sem);
+  poll_wait(filp, &dev->reader_wq, poll_table);
+  poll_wait(filp, &dev->writer_wq, poll_table);
+  if (!is_buffer_empty(dev)) {
+    mask |= POLLIN | POLLRDNORM;
+  }
+  if (!is_buffer_full(dev)) {
+    mask |= POLLOUT | POLLRDNORM;
+  }
+  if ((filp->f_flags & O_ACCMODE) == O_RDONLY && is_buffer_empty_and_has_no_writer(dev)) {
+    mask |= POLLHUP;
+  }
+
+  up(&dev->sem);
+  return mask;
 }
 
 module_init(scull_pipe_init);
