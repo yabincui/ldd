@@ -4,9 +4,11 @@ PWD := $(shell pwd)
 default:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
-obj-m := hello.o scull_pipe.o scull_delay.o scull_timer2.o
+obj-m := hello.o scull_pipe.o scull_delay.o scull_timer2.o scull_tasklet3.o
 
 scull_timer2-objs := scull_timer.o
+
+scull_tasklet3-objs := scull_tasklet.o
 
 RM = rm -rf
 clean:
