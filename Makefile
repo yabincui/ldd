@@ -5,7 +5,7 @@ default:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
 
 obj-m := hello.o scull_pipe.o scull_delay.o scull_timer2.o scull_tasklet3.o scull_workqueue.o \
-         scull_cache.o scull_page.o
+         scull_cache.o scull_page.o scull_vmalloc.o
 
 scull_timer2-objs := scull_timer.o
 
